@@ -1,5 +1,5 @@
 import math, torch, torch.nn.functional as F
-from torch import nn
+import torch.nn as nn
 from transformers.activations import ACT2FN
 from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
 from transformers.modeling_outputs import MoeCausalLMOutputWithPast
@@ -9,21 +9,21 @@ from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 # 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
 class MiniMindConfig(PretrainedConfig):
     model_type = "minimind"
-    def __init__(self, hidden_size=768, num_hidden_layers=8, use_moe=False, **kwargs):
+    def __init__(self, hidden_size=768, num_hidden_layers=8, use_moe=False, **kwargs): # kwargs: keyword arguments
         super().__init__(**kwargs)
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers
         self.use_moe = use_moe
-        self.dropout = kwargs.get("dropout", 0.0)
+        self.dropout = kwargs.get("dropout", 0.0) # 不使用 dropout，防止欠拟合
         self.vocab_size = kwargs.get("vocab_size", 6400)
-        self.bos_token_id = kwargs.get("bos_token_id", 1)
-        self.eos_token_id = kwargs.get("eos_token_id", 2)
+        self.bos_token_id = kwargs.get("bos_token_id", 1) # bos: begin of sequence
+        self.eos_token_id = kwargs.get("eos_token_id", 2) # eos: end of sequence
         self.flash_attn = kwargs.get("flash_attn", True)
         self.num_attention_heads = kwargs.get("num_attention_heads", 8)
         self.num_key_value_heads = kwargs.get("num_key_value_heads", 4)
         self.head_dim = kwargs.get("head_dim", self.hidden_size // self.num_attention_heads)
         self.hidden_act = kwargs.get("hidden_act", 'silu')
-        self.intermediate_size = kwargs.get("intermediate_size", math.ceil(hidden_size * math.pi / 64) * 64)
+        self.intermediate_size = kwargs.get("intermediate_size", math.ceil(hidden_size * math.pi / 64) * 64) # FFN 的中间层
         self.max_position_embeddings = kwargs.get("max_position_embeddings", 32768)
         self.rms_norm_eps = kwargs.get("rms_norm_eps", 1e-6)
         self.rope_theta = kwargs.get("rope_theta", 1e6)
@@ -47,20 +47,21 @@ class MiniMindConfig(PretrainedConfig):
 # 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
 #                                     MiniMind Model
 # 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
-class RMSNorm(torch.nn.Module):
+class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
+        self.weight = nn.Parameter(torch.ones(dim)) # 用来缩放 norm 的参数，也是可学习的参数
 
     def norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
-        return (self.weight * self.norm(x.float())).type_as(x)
+        return (self.weight * self.norm(x.float())).type_as(x) # 涉及到精度转换
 
 def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float = 1e6, rope_scaling: dict = None):
-    freqs, attn_factor = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)), 1.0
+    # (theta1, theta2, ..., theta_{d//2})
+    freqs, attn_factor = 1.0 / (rope_base ** (torch.arange(0, dim, 2).float() / dim)), 1.0 #(d//2,)
     if rope_scaling is not None: # YaRN: f'(i) = f(i)((1-γ) + γ/s), where γ∈[0,1] is linear ramp
         orig_max, factor, beta_fast, beta_slow, attn_factor = (
             rope_scaling.get("original_max_position_embeddings", 2048), rope_scaling.get("factor", 16),
@@ -71,14 +72,20 @@ def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float =
             low, high = max(math.floor(inv_dim(beta_fast)), 0), min(math.ceil(inv_dim(beta_slow)), dim // 2 - 1)
             ramp = torch.clamp((torch.arange(dim // 2, device=freqs.device).float() - low) / max(high - low, 0.001), 0, 1)
             freqs = freqs * (1 - ramp + ramp / factor)
-    t = torch.arange(end, device=freqs.device)
-    freqs = torch.outer(t, freqs).float()
-    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
-    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
+    t = torch.arange(end, device=freqs.device) # (end,)
+    freqs = torch.outer(t, freqs).float() # (end, d//2)
+    freqs_cos = torch.cos(freqs).repeat_interleave(2, dim=-1) # (end, d), (cos_1, cos_1, cos_2, cos_2,...)
+    freqs_sin = torch.sin(freqs).repeat_interleave(2, dim=-1)
     return freqs_cos, freqs_sin
 
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    def rotate_half(x): return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim=-1)
+    # 这里 q: (batch, seq_len, num_heads, head_dim)
+    # cos/sin: (seq_len, head_dim)
+    # 维度广播时必须要求从右往左维度一致，即需要往 cos/sin 的 1 天假一个维度，来充当 num_heads，方便广播，然后自动补齐 batch 的维度
+    def rotate_half(vec):
+        vec1 = vec[..., 0::2]
+        vec2 = vec[..., 1::2]
+        return torch.stack((-vec2, vec1), dim=-1) # (..., head_dim)
     q_embed = ((q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim))).to(q.dtype)
     k_embed = ((k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))).to(k.dtype)
     return q_embed, k_embed
