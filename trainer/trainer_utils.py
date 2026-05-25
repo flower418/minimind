@@ -116,8 +116,10 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
         return None
 
 
-def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', save_dir='../out', device='cuda'):
-    tokenizer = AutoTokenizer.from_pretrained(os.path.abspath(tokenizer_path))
+def init_model(lm_config, from_weight='pretrain', tokenizer_path=None, save_dir='../out', device='cuda'):
+    if tokenizer_path is None:
+        tokenizer_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'model')
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, local_files_only=True)
     model = MiniMindForCausalLM(lm_config)
 
     if from_weight!= 'none':
