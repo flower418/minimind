@@ -39,15 +39,18 @@ class PretrainDataset(Dataset):
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
+        # samples 为 data_path 中读到的
         self.samples = load_dataset('json', data_files=data_path, split='train')
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, index):
-        sample = self.samples[index]
+        sample = self.samples[index] # 读取原始文本
+        # -2 是因为不添加 bos，eos，需要手动添加
         tokens = self.tokenizer(str(sample['text']), add_special_tokens=False, max_length=self.max_length - 2, truncation=True).input_ids
-        tokens = [self.tokenizer.bos_token_id] + tokens + [self.tokenizer.eos_token_id]
+        tokens = [self.tokenizer.bos_token_id] + tokens + [self.tokenizer.eos_token_id] # 拼接完整 seq
+        # 对齐长度，保证 batch 里的每一个句子一样长
         input_ids = tokens + [self.tokenizer.pad_token_id] * (self.max_length - len(tokens))
         input_ids = torch.tensor(input_ids, dtype=torch.long)
         labels = input_ids.clone()

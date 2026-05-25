@@ -90,10 +90,16 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     k_embed = ((k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))).to(k.dtype)
     return q_embed, k_embed
 
+# 为 GQA 准备，多个 query 共用一个 kv
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    # 输入的 x 表示传入的  KV tensor
+    # n_rep 表示要重复的次数
+    # n_rep = num_query // num_key，多个 query 对应同一个 KV，因此要复制
     bs, slen, num_key_value_heads, head_dim = x.shape
     if n_rep == 1: return x
-    return (x[:, :, :, None, :].expand(bs, slen, num_key_value_heads, n_rep, head_dim).reshape(bs, slen, num_key_value_heads * n_rep, head_dim))
+    # 先增加一个维度，然后 expand 成 n_rep 进行复制，最后 reshape
+    # n_rep*num_key_value_heads=num_attention_heads
+    return (x.unsqueeze(-2).expand(bs, slen, num_key_value_heads, n_rep, head_dim).reshape(bs, slen, num_key_value_heads * n_rep, head_dim))
 
 class Attention(nn.Module):
     def __init__(self, config: MiniMindConfig):
@@ -101,26 +107,35 @@ class Attention(nn.Module):
         self.num_key_value_heads = config.num_attention_heads if config.num_key_value_heads is None else config.num_key_value_heads
         self.n_local_heads = config.num_attention_heads
         self.n_local_kv_heads = self.num_key_value_heads
-        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads # 多个 query 对应一个 KV
         self.head_dim = config.head_dim
         self.is_causal = True
-        self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=False)
+        # hidden_size 为 token embedding 后的维度
+        self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=False) # 不引入 bias
         self.k_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        # 将多个头的输出投影回标准的 hidden_size
         self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
+        # 在过 attention 前要先 norm
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.dropout = config.dropout
+        # 标志是否开启 flash attention
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and config.flash_attn
 
     def forward(self, x, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
-        bsz, seq_len, _ = x.shape
+        bsz, seq_len, _ = x.shape # (batch_size, seq_len, hidden_size)
+        # QKV 矩阵
+        # Q: (bsz, seq_len, num_attention_heads*head_dim)
+        # KV: (bsz, seq_len, num_key_value_heads*head_dim)
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        # 然后做一个 view 把 heads 拆分出来
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        # 对 QK 做 norm
         xq, xk = self.q_norm(xq), self.k_norm(xk)
         cos, sin = position_embeddings
         xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
@@ -128,10 +143,14 @@ class Attention(nn.Module):
             xk = torch.cat([past_key_value[0], xk], dim=1)
             xv = torch.cat([past_key_value[1], xv], dim=1)
         past_kv = (xk, xv) if use_cache else None
+        # transpose 以后维度变成 (bsz, num_heads, seq_len, head_dim)
         xq, xk, xv = (xq.transpose(1, 2), repeat_kv(xk, self.n_rep).transpose(1, 2), repeat_kv(xv, self.n_rep).transpose(1, 2))
         if self.flash and (seq_len > 1) and (not self.is_causal or past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
             output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=self.is_causal)
         else:
+            # Q: (bsz, num_heads, seq_len, head_dim)
+            # K: (bsz, num_heads, head_dim, seq_len)
+            # 相乘结果: (bsz, num_heads, seq_len, seq_len)
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
             if self.is_causal: scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), float("-inf"), device=scores.device).triu(1)
             if attention_mask is not None: scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
@@ -150,28 +169,34 @@ class FeedForward(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
+        # 用 gate 和 up_proj 将 x 升维，然后乘起来过 activation
+        # 然后再用 down_proj 降维
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 class MOEFeedForward(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
         self.config = config
+        # 路由
+        # 输出为 num_experts 个分数，决定该 token 应该分给那个 expert
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
         self.experts = nn.ModuleList([FeedForward(config, intermediate_size=config.moe_intermediate_size) for _ in range(config.num_experts)])
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
         batch_size, seq_len, hidden_dim = x.shape
-        x_flat = x.view(-1, hidden_dim)
-        scores = F.softmax(self.gate(x_flat), dim=-1)
+        x_flat = x.view(-1, hidden_dim) # (bsz*seq_len, hidden_dim)
+        scores = F.softmax(self.gate(x_flat), dim=-1) # (bsz*seq_len, num_experts)
         topk_weight, topk_idx = torch.topk(scores, k=self.config.num_experts_per_tok, dim=-1, sorted=False)
+        # 如果选了多个 expert，需要进行归一化，以确保概率和为 1
         if self.config.norm_topk_prob: topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-20)
-        y = torch.zeros_like(x_flat)
+        y = torch.zeros_like(x_flat) # (bsz*slen, hidden_dim)
         for i, expert in enumerate(self.experts):
-            mask = (topk_idx == i)
+            mask = (topk_idx == i) # mask 为选中的专家，比如选中了 0，2，然后当 i 便利到 0/2 时才能得到 mask
             if mask.any():
-                token_idx = mask.any(dim=-1).nonzero().flatten()
+                token_idx = mask.any(dim=-1).nonzero().flatten() # 获取分给每个专家的 token
                 weight = topk_weight[mask].view(-1, 1)
+                # 把专家 i 的输出加到 y 上
                 y.index_add_(0, token_idx, (expert(x_flat[token_idx]) * weight).to(y.dtype))
             elif self.training:
                 y[0, 0] += 0 * sum(p.sum() for p in expert.parameters())
@@ -214,10 +239,12 @@ class MiniMindModel(nn.Module):
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
     def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False, **kwargs):
+        # 传入的 input_ids 是取出一个 batch，然后每个 batch 有一个 max_length
         batch_size, seq_length = input_ids.shape
         if hasattr(past_key_values, 'layers'): past_key_values = None
         past_key_values = past_key_values or [None] * len(self.layers)
         start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+        # 对 input_ids 做一个 embedding，变成 (bsz, seq_len, embedding_dim), 如 (32, 512, 768)
         hidden_states = self.dropout(self.embed_tokens(input_ids))
         # Recompute RoPE buffers lost during meta-device init (transformers>=5.x)
         if self.freqs_cos[0, 0] == 0:
@@ -255,6 +282,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         logits = self.lm_head(hidden_states[:, slice_indices, :])
         loss = None
         if labels is not None:
+            # x 从第一个到倒数第二个，y 从第二个到倒数第一个，根据 x 预测 y，进行训练
             x, y = logits[..., :-1, :].contiguous(), labels[..., 1:].contiguous()
             loss = F.cross_entropy(x.view(-1, x.size(-1)), y.view(-1), ignore_index=-100)
         return MoeCausalLMOutputWithPast(loss=loss, aux_loss=aux_loss, logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
