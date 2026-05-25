@@ -27,6 +27,8 @@ def init_model(args):
     else:
         model = AutoModelForCausalLM.from_pretrained(args.load_from, trust_remote_code=True)
     get_model_params(model, model.config)
+    # half 把参数从 fp32 转到 fp16
+    # eval 表示现在是推理模式
     return model.half().eval().to(args.device), tokenizer
 
 def main():
@@ -68,25 +70,37 @@ def main():
     for prompt in prompt_iter:
         setup_seed(random.randint(0, 31415926))
         if input_mode == 0: print(f'💬: {prompt}')
+        # history 表示保留的对话轮数，比如 history=4，表示保留了 -4,-3,-2,-1 四轮对话，默认为 0
         conversation = conversation[-args.historys:] if args.historys else []
+        # 添加用户信息
         conversation.append({"role": "user", "content": prompt})
+        # 如果是 pretrain 阶段，就直接续写，给一串输入，加上 bos_token，然后开始续写，不能回复
         if 'pretrain' in args.weight:
             inputs = tokenizer.bos_token + prompt
+        # 如果是推理阶段，模型就能学会在 <|im_start|>assistant\n 之后的 token 要写成回复，然后到 <|im_end|> 结束
         else:
+            # apply_chat_template 将字典变成模型可读懂的格式，加上 special token，就能让模型进行回复
             inputs = tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True, open_thinking=bool(args.open_thinking))
         
+        # inputs 是一个字典，返回输入序列的全部 token，还额外返回一些 attention mask 之类的
         inputs = tokenizer(inputs, return_tensors="pt", truncation=True).to(args.device)
 
         print('🧠: ', end='')
         st = time.time()
         generated_ids = model.generate(
-            inputs=inputs["input_ids"], attention_mask=inputs["attention_mask"],
+            inputs=inputs["input_ids"], attention_mask=inputs["attention_mask"], # 输入的 token id
             max_new_tokens=args.max_new_tokens, do_sample=True, streamer=streamer,
             pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id,
             top_p=args.top_p, temperature=args.temperature, repetition_penalty=1
         )
+        # 训练时 generate_ids: (bsz, seq_len), 推理时，(1, seq_len), 不会自动降维，所以要加上 0
+        # 使用 inputs["input_ids"] 得到维度为 (bsz, seq_len) 的 token 序列，然后推理时取 bsz=1，所以要加上 0
+        # 从 input 后的 token 开始 decode
+        # skip_special_tokens 表示跳过 special token，回复的是纯文字
         response = tokenizer.decode(generated_ids[0][len(inputs["input_ids"][0]):], skip_special_tokens=True)
         conversation.append({"role": "assistant", "content": response})
+        # generated_ids 包含 input 和 output 的全部 token
+        # 用总长度减去输入长度得到生成的 token 数
         gen_tokens = len(generated_ids[0]) - len(inputs["input_ids"][0])
         print(f'\n[Speed]: {gen_tokens / (time.time() - st):.2f} tokens/s\n\n') if args.show_speed else print('\n\n')
 
