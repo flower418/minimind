@@ -85,7 +85,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     def rotate_half(vec):
         vec1 = vec[..., 0::2]
         vec2 = vec[..., 1::2]
-        return torch.stack((-vec2, vec1), dim=-1).flatten(-2)
+        return torch.stack((-vec2, vec1), dim=-1).flatten(-2) # 要加一个 flatten(-2)，否则维度会变成 (..., 48, 2) 而非 (..., 96)
     q_embed = ((q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim))).to(q.dtype)
     k_embed = ((k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))).to(k.dtype)
     return q_embed, k_embed
